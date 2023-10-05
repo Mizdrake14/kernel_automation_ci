@@ -1,5 +1,6 @@
 # Kernel compile workflow for personal usage
 # By Sarthak Roy (sarthakroy2002@gmail.com)
+# Modified for reuse by Christopher K. Irvine (mizdrake7@gmail.com)
 
 name: Kernel CI
 
@@ -31,8 +32,8 @@ jobs:
     steps:
       - name: Initializing environment
         run: |
-          git config --global user.name "sarthakroy2002"
-          git config --global user.email "sarthakroy2002@gmail.com"
+          git config --global user.name "mizdrake7"
+          git config --global user.email "mizdrake7@gmail.com"
           df -h
           ld --version
           gcc -v
@@ -46,13 +47,13 @@ jobs:
           git clone $REPO -b $BRANCH kernel 
           cd kernel
           if [ "${DEVICE}" = "RMX2020" ]; then
-            wget https://raw.githubusercontent.com/sarthakroy2002/Scripts/main/Kernel/C3_build_script.sh
+            wget https://raw.githubusercontent.com/mizdrake7/Scripts/main/Kernel/C3_build_script.sh
             bash C3_build_script.sh
           elif [ "${DEVICE}" = "RM6785" ]; then
-            wget https://raw.githubusercontent.com/sarthakroy2002/Scripts/main/Kernel/wasabi_build_script.sh
+            wget https://raw.githubusercontent.com/mizdrake7/Scripts/main/Kernel/wasabi_build_script.sh
             bash wasabi_build_script.sh
           elif [ "${DEVICE}" = "r5x" ]; then
-            wget https://raw.githubusercontent.com/sarthakroy2002/Scripts/main/Kernel/r5x_build_script.sh
+            wget https://raw.githubusercontent.com/mizdrake7/Scripts/main/Kernel/r5x_build_script.sh
             bash r5x_build_script.sh
           else
             echo "Invalid device '${DEVICE}'"
