@@ -109,18 +109,20 @@ jobs:
             echo "Makefile not found at $MF_PATH"
           fi
 
-      - name: Register clang from AOSP prebuilts
+      - name: Register clang and lld
         run: |
           set -e
-          CLANG_DIR=$(find "$GITHUB_WORKSPACE" -path "*/kernel-build-tools/linux-x86/bin" -type d -maxdepth 8 | head -n1 || true)
-          if [ -n "$CLANG_DIR" ]; then
-            echo "$CLANG_DIR" >> $GITHUB_PATH
-            echo "Using AOSP build tools clang at $CLANG_DIR"
+          CLANG_PATH=$(find "$GITHUB_WORKSPACE" -path "*/kernel-build-tools/linux-x86/bin" -type d -maxdepth 8)
+          if [ -n "$CLANG_PATH" ]; then
+            echo "$CLANG_PATH" >> $GITHUB_PATH
+            echo "Using AOSP build tools at $CLANG_PATH"
           else
-            echo "No embedded clang found, you may need to add toolchain manually."
+            echo "AOSP build tools not found!"
+            exit 1
           fi
-          which clang || { echo "clang not found in PATH"; exit 1; }
-          which ld.lld || { echo "ld.lld not found in PATH"; exit 1; }
+          
+          which clang
+          which ld.lld || { echo "ld.lld not found in PATH after registration!"; exit 1; }
 
       - name: Apply ptrace patch
         run: |
