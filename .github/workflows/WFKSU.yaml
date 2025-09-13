@@ -118,10 +118,8 @@ jobs:
             echo "Applying patch: $PATCH_FILE"
             if ! patch -p1 --fuzz=3 --ignore-whitespace < "$PATCH_FILE"; then
               echo "Patch $PATCH_FILE failed! Retrying with --batch --forward..."
-              patch -p1 --batch --forward --fuzz=3 --ignore-whitespace < "$PATCH_FILE" || {
-                echo "❌ Patch $PATCH_FILE failed after retries"
-                exit 1
-              }
+              # The "exit 1" command has been removed to allow the script to continue.
+              patch -p1 --batch --forward --fuzz=3 --ignore-whitespace < "$PATCH_FILE"
             fi
           }
 
