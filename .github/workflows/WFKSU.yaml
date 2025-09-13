@@ -1,4 +1,4 @@
-name: Build WildFlower-Kernel
+name: Build WildKernel
 
 on:
   workflow_dispatch:
@@ -106,13 +106,28 @@ jobs:
           echo "$GITHUB_WORKSPACE/$CLANG_DIR/$CLANG_VERSION_TAG/bin" >> $GITHUB_PATH
           echo "CLANG_BIN_PATH=$GITHUB_WORKSPACE/$CLANG_DIR/$CLANG_VERSION_TAG/bin" >> $GITHUB_ENV
 
-      # --- Step 7: Apply patches and config ---
+      # --- Step 7: Apply patches and config with recheck ---
       - name: Apply patches and prepare config
         run: |
+          set -e
           KROOT="$GITHUB_WORKSPACE/$CONFIG"
           cd "$KROOT"
 
-          patch -p1 --fuzz=3 --ignore-whitespace < "$GITHUB_WORKSPACE/kernel_patches/gki_ptrace.patch"
+          apply_patch() {
+            PATCH_FILE="$1"
+            echo "Applying patch: $PATCH_FILE"
+            if ! patch -p1 --fuzz=3 --ignore-whitespace < "$PATCH_FILE"; then
+              echo "Patch $PATCH_FILE failed! Retrying with --batch --forward..."
+              patch -p1 --batch --forward --fuzz=3 --ignore-whitespace < "$PATCH_FILE" || {
+                echo "❌ Patch $PATCH_FILE failed after retries"
+                exit 1
+              }
+            fi
+          }
+
+          # Apply patches
+          apply_patch "$GITHUB_WORKSPACE/kernel_patches/gki_ptrace.patch"
+
           curl -LSs "https://raw.githubusercontent.com/WildKernels/Wild_KSU/wild/kernel/setup.sh" | bash -s wild
 
           cp -r "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/fs/"* "$KROOT/fs/" 2>/dev/null || true
@@ -120,17 +135,16 @@ jobs:
 
           cd "$KROOT/Wild_KSU"
           cp ../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch .
-          patch -p1 --fuzz=3 --ignore-whitespace < 10_enable_susfs_for_ksu.patch
+          apply_patch "10_enable_susfs_for_ksu.patch"
 
           cd "$KROOT"
-          patch -p1 --fuzz=3 --ignore-whitespace < "$GITHUB_WORKSPACE/kernel_patches/wild/hooks/scope_min_manual_hooks_v1.4.patch"
-          patch -p1 --fuzz=3 --ignore-whitespace < "$GITHUB_WORKSPACE/kernel_patches/69_hide_stuff.patch"
+          apply_patch "$GITHUB_WORKSPACE/kernel_patches/wild/hooks/scope_min_manual_hooks_v1.4.patch"
+          apply_patch "$GITHUB_WORKSPACE/kernel_patches/69_hide_stuff.patch"
 
           DEF="$KROOT/arch/arm64/configs/gki_defconfig"
           echo "CONFIG_KSU=y" >> "$DEF"
           echo "CONFIG_KSU_SUSFS=y" >> "$DEF"
 
-          # generate .config
           make O=out ARCH=arm64 gki_defconfig
 
       # --- Step 8: Build Kernel ---
