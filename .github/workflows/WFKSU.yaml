@@ -13,9 +13,11 @@ jobs:
     env:
       KERNEL_VERSION: "5.15"
       CONFIG: "WILDFlower-android13-5.15-common-GKI"
+      ANDROID_VERSION: "android13"
       SUB_LEVEL: "185"
       OS_PATCH_LEVEL: "2025-07"
-      ANDROID_VERSION: "android13"
+      BRANCH: "android13-5.15"
+      CLANG_VERSION: "r547379"
       GITHUB_WORKSPACE: ${{ github.workspace }}
 
     steps:
@@ -40,14 +42,10 @@ jobs:
 
           if [ ! -d kernel-build-tools ]; then
             git clone --depth 1 -b "$TOOLS_BRANCH" "$AOSP_MIRROR/kernel/prebuilts/build-tools" kernel-build-tools
-          else
-            cd kernel-build-tools && git pull && cd ..
           fi
 
           if [ ! -d mkbootimg ]; then
             git clone --depth 1 -b main "$AOSP_MIRROR/platform/system/tools/mkbootimg" mkbootimg
-          else
-            cd mkbootimg && git pull && cd ..
           fi
 
           echo "AVBTOOL=$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/bin/avbtool" >> $GITHUB_ENV
@@ -69,21 +67,17 @@ jobs:
         run: |
           if [ ! -d kernel_patches ]; then
             git clone --depth 1 https://github.com/WildKernels/kernel_patches.git
-          else
-            cd kernel_patches && git pull && cd ..
           fi
 
           if [ ! -d susfs4ksu ]; then
             git clone --depth 1 -b "gki-$ANDROID_VERSION-$KERNEL_VERSION" https://gitlab.com/simonpunk/susfs4ksu.git
-          else
-            cd susfs4ksu && git pull && cd ..
           fi
 
       # --- Step 5: Clone Kernel Source ---
       - name: Clone Kernel Source
         run: |
           if [ ! -d "$CONFIG" ]; then
-            git clone --depth=1 https://github.com/mizdrake7/WILDFlower-android13-5.15-common-GKI "$CONFIG"
+            git clone --depth=1 -b $BRANCH https://github.com/mizdrake7/WILDFlower-android13-5.15-common-GKI "$CONFIG"
           else
             cd "$CONFIG" && git pull && cd ..
           fi
@@ -92,26 +86,30 @@ jobs:
       - name: Setup Clang toolchain
         run: |
           AOSP_CLANG_REPO="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86"
-          CLANG_VERSION="clang-r547379"
+          CLANG_TAG="clang-$CLANG_VERSION"
           CLANG_DIR="clang_prebuilt"
 
-          if [ ! -d "$CLANG_DIR" ]; then
-            git clone --depth 1 -b "refs/heads/main" "$AOSP_CLANG_REPO" "$CLANG_DIR"
-          else
-            cd "$CLANG_DIR" && git pull && cd ..
+          if [ ! -d "$CLANG_DIR/$CLANG_TAG" ]; then
+            git clone --depth 1 -b main "$AOSP_CLANG_REPO" "$CLANG_DIR"
           fi
 
-          echo "$GITHUB_WORKSPACE/$CLANG_DIR/$CLANG_VERSION/bin" >> $GITHUB_PATH
+          CLANG_PATH="$GITHUB_WORKSPACE/$CLANG_DIR/$CLANG_TAG"
+          echo "✅ Using clang-$CLANG_VERSION from $CLANG_PATH"
+          echo "CLANG_BIN_PATH=$CLANG_PATH/bin" >> $GITHUB_ENV
+          echo "$CLANG_PATH/bin" >> $GITHUB_PATH
 
       # --- Step 7: Apply patches and config ---
       - name: Apply patches and prepare config
         run: |
           KROOT="$GITHUB_WORKSPACE/$CONFIG"
           cd "$KROOT"
+
           patch -p1 -F 3 < "$GITHUB_WORKSPACE/kernel_patches/gki_ptrace.patch" || true
           curl -LSs "https://raw.githubusercontent.com/WildKernels/Wild_KSU/wild/kernel/setup.sh" | bash -s wild
+
           cp -r "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/fs/"* "$KROOT/fs/" 2>/dev/null || true
           cp -r "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/include/linux/"* "$KROOT/include/linux/" 2>/dev/null || true
+
           cd "$KROOT/Wild_KSU"
           cp ../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch .
           patch -p1 --forward < 10_enable_susfs_for_ksu.patch || true
@@ -129,7 +127,9 @@ jobs:
         run: |
           KROOT="$GITHUB_WORKSPACE/$CONFIG"
           cd "$KROOT"
-          make -j"$(nproc)" O=out LLVM=1 LLVM_IAS=1 ARCH=arm64 CROSS_COMPILE="$CROSS_COMPILE"
+          PATH=$CLANG_BIN_PATH:$PATH \
+          make -j"$(nproc)" O=out LLVM=1 LLVM_IAS=1 ARCH=arm64 CC=clang \
+            SUB_LEVEL=$SUB_LEVEL OS_PATCH_LEVEL=$OS_PATCH_LEVEL
 
       # --- Step 9: Package AnyKernel3 ---
       - name: Package AnyKernel3
