@@ -1,4 +1,4 @@
-name: Build Android Kernel (WILDFlower GKI + KernelSU & SUSFS)
+name: Kernel Build
 
 permissions:
   contents: write
@@ -8,17 +8,26 @@ on:
   workflow_dispatch:
     inputs:
       os_patch_level:
-        description: 'OS Patch Level (e.g. 2025-05)'
+        description: 'OS Patch Level (e.g., 2025-05)'
         required: true
         default: '2025-05'
       sub_level:
-        description: 'Kernel Sub Level (e.g. 180 or X for LTS auto)'
+        description: 'Kernel Sub Level (e.g., 180 or X for auto-detect)'
         required: true
         default: 'X'
       revision:
-        description: 'Optional revision string used for some GKI URLs'
+        description: 'Optional revision string (for some GKI URLs)'
         required: false
         default: ''
+
+env:
+  ANDROID_VERSION: android13
+  KERNEL_VERSION: 5.15
+  REPO_URL: https://github.com/mizdrake7/WILDFlower-android13-5.15-common-GKI.git
+  REPO_BRANCH: android13-5.15
+  ANYKERNEL_BRANCH: gki-2.0
+  CROSS_COMPILE: aarch64-linux-android-
+  CONFIG_BASE: build
 
 jobs:
   build:
@@ -26,31 +35,20 @@ jobs:
     timeout-minutes: 240
     strategy:
       matrix:
-        build_type: [normal, make]
-
-    env:
-      ANDROID_VERSION: "android13"
-      KERNEL_VERSION: "5.15"
-      REPO_URL: "https://github.com/mizdrake7/WILDFlower-android13-5.15-common-GKI.git"
-      REPO_BRANCH: "android13-5.15"
-      ANYKERNEL_BRANCH: "gki-2.0"
-      KERNEL_GIT_NAME: "WILDFlower-android13-5.15-common-GKI"
-      CROSS_COMPILE: "aarch64-linux-android-"
-
+        build_type: [make, normal]
     steps:
-      - name: Checkout repo (build scripts / patches)
+      - name: Checkout workflow repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Set CONFIG Environment Variable
-        id: set_config
+      - name: Derive CONFIG directory
         run: |
-          CONFIG="${ANDROID_VERSION}-${KERNEL_VERSION}-${{ inputs.sub_level }}"
+          CONFIG="${{ env.CONFIG_BASE }}-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}-${{ inputs.sub_level }}"
           echo "CONFIG=$CONFIG" >> $GITHUB_ENV
           echo "CONFIG=$CONFIG"
 
-      - name: Install base packages
+      - name: Install packages
         run: |
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
@@ -58,177 +56,221 @@ jobs:
             python3 python3-pip git pkg-config zlib1g-dev llvm clang protobuf-compiler \
             openjdk-11-jdk ninja-build
 
-      - name: Prepare repo tool and build tools
+      - name: Prepare repo + build tools
         run: |
-          mkdir -p ./git-repo
-          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o ./git-repo/repo
-          chmod +x ./git-repo/repo
+          mkdir -p git-repo
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o git-repo/repo
+          chmod +x git-repo/repo
           echo "REPO=$GITHUB_WORKSPACE/git-repo/repo" >> $GITHUB_ENV
-
+          
           AOSP_MIRROR=https://android.googlesource.com
-          BRANCH=main-kernel-2025 || true
-          git clone --depth 1 "$AOSP_MIRROR/kernel/prebuilts/build-tools" -b "$BRANCH" kernel-build-tools || true
-          git clone --depth 1 "$AOSP_MIRROR/platform/system/tools/mkbootimg" -b "$BRANCH" mkbootimg || true
+          TOOLS_BRANCH=main-kernel-2025
+          set -e
+          git clone --depth 1 -b "$TOOLS_BRANCH" "$AOSP_MIRROR/kernel/prebuilts/build-tools" kernel-build-tools
+          git clone --depth 1 -b "$TOOLS_BRANCH" "$AOSP_MIRROR/platform/system/tools/mkbootimg" mkbootimg
+          
+          echo "AVBTOOL=$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/bin/avbtool" >> $GITHUB_ENV
+          echo "MKBOOTIMG=$GITHUB_WORKSPACE/mkbootimg/mkbootimg.py" >> $GITHUB_ENV
+          echo "UNPACK_BOOTIMG=$GITHUB_WORKSPACE/mkbootimg/unpack_bootimg.py" >> $GITHUB_ENV
+          echo "BOOT_SIGN_KEY_PATH=$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/share/avb/testkey_rsa2048.pem" >> $GITHUB_ENV
+          echo "$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/bin" >> $GITHUB_PATH
 
-          if [ -d "$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/bin" ]; then
-            echo "AVBTOOL=$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/bin/avbtool" >> $GITHUB_ENV
-            echo "PATH=$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/bin:$PATH" >> $GITHUB_ENV
-          fi
-          if [ -f "$GITHUB_WORKSPACE/mkbootimg/mkbootimg.py" ]; then
-            echo "MKBOOTIMG=$GITHUB_WORKSPACE/mkbootimg/mkbootimg.py" >> $GITHUB_ENV
-            echo "UNPACK_BOOTIMG=$GITHUB_WORKSPACE/mkbootimg/unpack_bootimg.py" >> $GITHUB_ENV
-          fi
-          if [ -d "$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/share/avb" ]; then
-            echo "BOOT_SIGN_KEY_PATH=$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/share/avb/testkey_rsa2048.pem" >> $GITHUB_ENV
-          fi
-
-      - name: Set boot sign key (from secret if provided)
+      - name: Inject custom boot sign key (if secret present)
         env:
           BOOT_SIGN_KEY: ${{ secrets.BOOT_SIGN_KEY }}
         run: |
           if [ -n "$BOOT_SIGN_KEY" ]; then
-            mkdir -p "$(dirname "$BOOT_SIGN_KEY_PATH")" || true
-            echo "$BOOT_SIGN_KEY" > "${BOOT_SIGN_KEY_PATH:-./testkey_rsa2048.pem}"
-            chmod 600 "${BOOT_SIGN_KEY_PATH:-./testkey_rsa2048.pem}"
+            KEY_PATH="${BOOT_SIGN_KEY_PATH:-$GITHUB_WORKSPACE/testkey_rsa2048.pem}"
+            echo "$BOOT_SIGN_KEY" > "$KEY_PATH"
+            chmod 600 "$KEY_PATH"
+            echo "Using provided signing key at $KEY_PATH"
+          else
+            echo "Using default test key (no secret supplied)."
           fi
 
-      - name: Clone AnyKernel3 and other deps
-        run: |
-          git clone https://github.com/WildKernels/AnyKernel3.git -b ${ANYKERNEL_BRANCH} --depth 1 || true
-          git clone https://gitlab.com/simonpunk/susfs4ksu.git --depth 1 || true
-          git clone https://github.com/WildKernels/kernel_patches.git --depth 1 || true
-
-      - name: Initialize and Sync Kernel Source (repo)
+      - name: Fetch Kernel Source (manifest first, git fallback)
+        id: fetch_source
         run: |
           set -e
-          CONFIG_DIR="$CONFIG"
-          mkdir -p "$CONFIG_DIR"
-          cd "$CONFIG_DIR"
-
-          FORMATTED_BRANCH="${ANDROID_VERSION}-${KERNEL_VERSION}-${{ inputs.os_patch_level }}"
-          REPO_BIN="${REPO:-$GITHUB_WORKSPACE/git-repo/repo}"
-          if [ ! -x "$REPO_BIN" ]; then
-            chmod +x "$REPO_BIN" || true
-          fi
-
-          if [ -x "$REPO_BIN" ]; then
-            "$REPO_BIN" init --depth=1 --u https://android.googlesource.com/kernel/manifest -b common-"$FORMATTED_BRANCH" --repo-rev=v2.16 || true
-            "$REPO_BIN" sync -c -j$(nproc) --no-tags --fail-fast || true
+          mkdir -p "$CONFIG"
+          cd "$CONFIG"
+          
+          FORMATTED_BRANCH="common-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}-${{ inputs.os_patch_level }}"
+          echo "Attempting repo manifest branch: $FORMATTED_BRANCH"
+          
+          if "$REPO" init --depth=1 -u https://android.googlesource.com/kernel/manifest -b "$FORMATTED_BRANCH" --repo-rev=v2.16; then
+            "$REPO" sync -c -j$(nproc) --no-tags --fail-fast
+            echo "LAYOUT=manifest" >> $GITHUB_ENV
           else
-            cd ..
-            git clone --depth 1 -b ${REPO_BRANCH} ${REPO_URL} kernel || true
-            cd "$CONFIG_DIR"
+            echo "Manifest init failed; falling back to single git clone."
+            git clone --depth 1 -b "${{ env.REPO_BRANCH }}" "${{ env.REPO_URL }}" kernel
+            echo "LAYOUT=single" >> $GITHUB_ENV
+          fi
+          
+          cd "$GITHUB_WORKSPACE"
+          echo "Source layout: $(cat $GITHUB_ENV | grep LAYOUT)"
+
+      - name: Verify Source Layout
+        run: |
+          set -e
+          if [ "${LAYOUT}" = "manifest" ] && [ ! -d "${CONFIG}/common" ]; then
+            echo "Expected ${CONFIG}/common directory but not found."
+            find "${CONFIG}" -maxdepth 3 -type d
+            exit 1
+          fi
+          if [ "${LAYOUT}" = "single" ] && [ ! -d "${CONFIG}/kernel" ]; then
+            echo "Expected ${CONFIG}/kernel directory but not found."
+            find "${CONFIG}" -maxdepth 3 -type d
+            exit 1
           fi
 
-      - name: Extract Actual Sublevel (if X)
+      - name: Extract Actual Sublevel (if requested)
         if: ${{ inputs.sub_level == 'X' }}
         run: |
-          set -e || true
-          cd "$CONFIG"
-          if [ -f "common/Makefile" ]; then
-            ACTUAL_SUBLEVEL=$(grep '^SUBLEVEL\s*[:=]\s*' common/Makefile | head -n1 | awk -F'[:=]' '{print $2}' | xargs || true)
+          set -e
+          # Choose correct Makefile path
+          if [ "${LAYOUT}" = "manifest" ]; then
+            MF="${CONFIG}/common/Makefile"
+          else
+            MF="${CONFIG}/kernel/Makefile"
+          fi
+          if [ -f "$MF" ]; then
+            ACTUAL_SUBLEVEL=$(grep -E '^SUBLEVEL[[:space:]:=]+' "$MF" | head -n1 | awk -F'[ :=]' '{print $2}')
             if [ -n "$ACTUAL_SUBLEVEL" ]; then
               echo "ACTUAL_SUBLEVEL=$ACTUAL_SUBLEVEL" >> $GITHUB_ENV
-              NEW_CONFIG="${ANDROID_VERSION}-${KERNEL_VERSION}-$ACTUAL_SUBLEVEL"
-              echo "CONFIG=$NEW_CONFIG" >> $GITHUB_ENV
-              cd ..
-              if [ -d "$CONFIG" ] && [ ! -d "$NEW_CONFIG" ]; then
-                mv "$CONFIG" "$NEW_CONFIG" || true
+              NEW_CONFIG="build-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}-${ACTUAL_SUBLEVEL}"
+              if [ "$NEW_CONFIG" != "$CONFIG" ]; then
+                mv "$CONFIG" "$NEW_CONFIG"
+                echo "CONFIG=$NEW_CONFIG" >> $GITHUB_ENV
+                echo "Renamed build directory to $NEW_CONFIG"
               fi
             fi
+          else
+            echo "Makefile not found at $MF; cannot extract sublevel."
           fi
 
-      - name: Apply ptrace patch for 5.15
+      - name: Show directory tree (debug)
         run: |
-          cd "$CONFIG" || true
-          if [ -f "../kernel_patches/gki_ptrace.patch" ]; then
-            patch -p1 -F 3 < "../kernel_patches/gki_ptrace.patch" || true
+          echo "CONFIG=$CONFIG LAYOUT=$LAYOUT"
+          find "$CONFIG" -maxdepth 3 -type f -name Makefile | sed 's|^|FOUND: |'
+          du -sh "$CONFIG"/* || true
+
+      - name: Apply ptrace patch (5.15)
+        run: |
+          set -e
+          TARGET_ROOT="$CONFIG/$( [ "$LAYOUT" = manifest ] && echo common || echo kernel )"
+          if [ -f "kernel_patches/gki_ptrace.patch" ]; then
+            echo "Applying ptrace patch"
+            (cd "$TARGET_ROOT" && patch -p1 -F 3 < "$GITHUB_WORKSPACE/kernel_patches/gki_ptrace.patch")
+          else
+            echo "ptrace patch not found; skipping."
           fi
 
       - name: Add KernelSU
         run: |
-          cd "$CONFIG" || true
-          curl -LSs "https://raw.githubusercontent.com/WildKernels/Wild_KSU/wild/kernel/setup.sh" | bash -s wild || true
+          set -e
+          cd "$CONFIG/$( [ "$LAYOUT" = manifest ] && echo common || echo kernel )"
+          curl -LSs "https://raw.githubusercontent.com/WildKernels/Wild_KSU/wild/kernel/setup.sh" | bash -s wild
 
       - name: Apply SUSFS patches
         run: |
-          set -e || true
-          cd "$CONFIG" || true
-          if [ -d "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches" ]; then
-            cp "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/50_add_susfs_in_gki-${ANDROID_VERSION}-${KERNEL_VERSION}.patch" ./common/ 2>/dev/null || true
-            cd common || true
-            patch -p1 --forward < 50_add_susfs_in_gki-${ANDROID_VERSION}-${KERNEL_VERSION}.patch 2>/dev/null || true
-            cd ..
-            cp -r "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/fs/" ./common/fs/ 2>/dev/null || true
-            cp -r "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/include/linux/" ./common/include/linux/ 2>/dev/null || true
-          fi
-
-      - name: Apply Hooks and Hide Stuff patches
-        run: |
-          cd "$CONFIG/common" || true
-          if [ -f "$GITHUB_WORKSPACE/kernel_patches/wild/hooks/scope_min_manual_hooks_v1.4.patch" ]; then
-            cp "$GITHUB_WORKSPACE/kernel_patches/wild/hooks/scope_min_manual_hooks_v1.4.patch" .
-            patch -p1 --forward -F 3 < scope_min_manual_hooks_v1.4.patch || true
-          fi
-          if [ -f "$GITHUB_WORKSPACE/kernel_patches/69_hide_stuff.patch" ]; then
-            cp "$GITHUB_WORKSPACE/kernel_patches/69_hide_stuff.patch" .
-            patch -p1 --forward -F 3 < 69_hide_stuff.patch || true
-          fi
-
-      - name: Apply Module Symbol Version Fix
-        run: |
-          cd "$CONFIG" || true
-          if [ -d "./common/kernel/module" ]; then
-            sed -i '/bad_version:/{:a;n;/return 0;/{s/return 0;/return 1;/;b};ba}' ./common/kernel/module/version.c 2>/dev/null || true
+          set -e
+          KROOT="$CONFIG/$( [ "$LAYOUT" = manifest ] && echo common || echo kernel )"
+          if [ -d susfs4ksu/kernel_patches ]; then
+            PATCH="susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch"
+            if [ -f "$PATCH" ]; then
+              cp "$PATCH" "$KROOT/"
+              (cd "$KROOT" && patch -p1 --forward < "$(basename "$PATCH")")
+            else
+              echo "SUSFS base patch not found for version; skipping main patch."
+            fi
+            # File additions
+            cp -r susfs4ksu/kernel_patches/fs/* "$KROOT/fs/" 2>/dev/null || true
+            cp -r susfs4ksu/kernel_patches/include/linux/* "$KROOT/include/linux/" 2>/dev/null || true
           else
-            sed -i '/bad_version:/{:a;n;/return 0;/{s/return 0;/return 1;/;b};ba}' ./common/kernel/module.c 2>/dev/null || true
+            echo "No SUSFS patches directory."
           fi
 
-      - name: Apply Kernel Configuration
+      - name: Apply Hooks / Hide patches
         run: |
-          set -e || true
-          defconfig="./common/arch/arm64/configs/gki_defconfig"
-          if [ -f "$defconfig" ]; then
-            grep -qxF "CONFIG_KSU=y" "$defconfig" || echo "CONFIG_KSU=y" >> "$defconfig"
-            grep -qxF "CONFIG_KSU_KPROBES_HOOK=n" "$defconfig" || echo "CONFIG_KSU_KPROBES_HOOK=n" >> "$defconfig"
+          set -e
+          KROOT="$CONFIG/$( [ "$LAYOUT" = manifest ] && echo common || echo kernel )"
+          if [ -f kernel_patches/wild/hooks/scope_min_manual_hooks_v1.4.patch ]; then
+            (cd "$KROOT" && patch -p1 --forward -F 3 < "$GITHUB_WORKSPACE/kernel_patches/wild/hooks/scope_min_manual_hooks_v1.4.patch" || true)
+          fi
+          if [ -f kernel_patches/69_hide_stuff.patch ]; then
+            (cd "$KROOT" && patch -p1 --forward -F 3 < "$GITHUB_WORKSPACE/kernel_patches/69_hide_stuff.patch" || true)
           fi
 
-      - name: Build kernel (make flow)
+      - name: Fix Module Symbol Version check
+        run: |
+          set -e
+          KROOT="$CONFIG/$( [ "$LAYOUT" = manifest ] && echo common || echo kernel )"
+          FILE1="$KROOT/kernel/module/version.c"
+          FILE2="$KROOT/kernel/module.c"
+          TARGET=""
+          [ -f "$FILE1" ] && TARGET="$FILE1"
+          # fallback
+          [ -z "$TARGET" ] && [ -f "$FILE2" ] && TARGET="$FILE2"
+          if [ -n "$TARGET" ]; then
+            sed -i '/bad_version:/{:a;n;/return 0;/{s/return 0;/return 1;/;b};ba}' "$TARGET"
+            echo "Patched $TARGET"
+          else
+            echo "Module version file not found; skipping."
+          fi
+
+      - name: Ensure Kernel Config flags
+        run: |
+          set -e
+          KROOT="$CONFIG/$( [ "$LAYOUT" = manifest ] && echo common || echo kernel )"
+          DEF="$KROOT/arch/arm64/configs/gki_defconfig"
+          if [ -f "$DEF" ]; then
+            grep -q '^CONFIG_KSU=y' "$DEF" || echo 'CONFIG_KSU=y' >> "$DEF"
+            grep -q '^CONFIG_KSU_KPROBES_HOOK=n' "$DEF" || echo 'CONFIG_KSU_KPROBES_HOOK=n' >> "$DEF"
+          else
+            echo "gki_defconfig not found at $DEF" && exit 1
+          fi
+
+      - name: Build (make flow)
         if: ${{ matrix.build_type == 'make' }}
         run: |
           set -e
-          KERNEL_PATH="$GITHUB_WORKSPACE/$CONFIG"
-          cd "$KERNEL_PATH/common" || exit 1
-          make -j$(nproc --all) O=out LLVM=1 ARCH=arm64 CROSS_COMPILE=${CROSS_COMPILE} gki_defconfig
-          make -j$(nproc --all) O=out LLVM=1 ARCH=arm64 CROSS_COMPILE=${CROSS_COMPILE}
+          KROOT="$CONFIG/$( [ "$LAYOUT" = manifest ] && echo common || echo kernel )"
+          cd "$KROOT"
+          make -j$(nproc) O=out LLVM=1 ARCH=arm64 CROSS_COMPILE=${{ env.CROSS_COMPILE }} gki_defconfig
+          make -j$(nproc) O=out LLVM=1 ARCH=arm64 CROSS_COMPILE=${{ env.CROSS_COMPILE }}
 
-      - name: Build kernel (legacy flow)
+      - name: Build (legacy fallback flow)
         if: ${{ matrix.build_type == 'normal' }}
         run: |
           set -e
-          cd "$GITHUB_WORKSPACE/$CONFIG/kernel" || exit 1
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export CROSS_COMPILE=${CROSS_COMPILE}
-          export CC=clang
-          export LLVM=1
+          # For single-clone layout build inside kernel/ ; for manifest we can still reuse common/
+          KROOT="$CONFIG/$( [ "$LAYOUT" = manifest ] && echo common || echo kernel )"
+          cd "$KROOT"
+          export ARCH=arm64 SUBARCH=arm64 CROSS_COMPILE=${{ env.CROSS_COMPILE }} LLVM=1 CC=clang
           make -j$(nproc) gki_defconfig
           make -j$(nproc)
 
-      - name: Create Kernel ZIP
+      - name: Collect Image and Create AnyKernel zip
         run: |
           set -e
-          IMAGE_SRC="$CONFIG/common/out/arch/arm64/boot/Image"
-          cp "$IMAGE_SRC" AnyKernel3/Image || true
-          SUBLEVEL_FOR_NAME="${ACTUAL_SUBLEVEL:-${{ inputs.sub_level }}}"
-          ZIP_NAME="WFKSU-${ANDROID_VERSION}-${KERNEL_VERSION}.${SUBLEVEL_FOR_NAME}-${{ inputs.os_patch_level }}-AnyKernel3.zip"
-          cd AnyKernel3
-          zip -r "../$ZIP_NAME" ./*
+          KROOT="$CONFIG/$( [ "$LAYOUT" = manifest ] && echo common || echo kernel )"
+          IMG_PATH="$KROOT/out/arch/arm64/boot/Image"
+          if [ ! -f "$IMG_PATH" ]; then
+            echo "Kernel Image not found at $IMG_PATH"
+            find "$KROOT/out" -maxdepth 4 -type f | head
+            exit 1
+          fi
+          git clone --depth 1 -b ${{ env.ANYKERNEL_BRANCH }} https://github.com/WildKernels/AnyKernel3.git anykernel
+          cp "$IMG_PATH" anykernel/Image
+          SUBLEVEL="${ACTUAL_SUBLEVEL:-${{ inputs.sub_level }}}"
+          ZIP_NAME="WFKSU-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.${SUBLEVEL}-${{ inputs.os_patch_level }}-${{ matrix.build_type }}-AnyKernel3.zip"
+          (cd anykernel && zip -r "../$ZIP_NAME" .)
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
 
-      - name: Upload Build Artifacts
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: WKSU-${ANDROID_VERSION}-${KERNEL_VERSION}.${{ env.ACTUAL_SUBLEVEL || inputs.sub_level }}-${{ inputs.os_patch_level }}-${{ matrix.build_type }}
+          name: WKSU-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.${{ env.ACTUAL_SUBLEVEL || inputs.sub_level }}-${{ inputs.os_patch_level }}-${{ matrix.build_type }}
           path: |
             *.zip
-            *.img
