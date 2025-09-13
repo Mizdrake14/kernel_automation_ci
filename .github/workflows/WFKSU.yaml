@@ -1,0 +1,394 @@
+name: Build Android Kernel (WILDFlower GKI + KernelSU & SUSFS)
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      android_version:
+        description: 'Android version (eg. android13)'
+        required: true
+        default: 'android13'
+      kernel_version:
+        description: 'Kernel version (eg. 5.15)'
+        required: true
+        default: '5.15'
+      os_patch_level:
+        description: 'OS Patch Level (e.g. 2025-05)'
+        required: true
+        default: '2025-05'
+      sub_level:
+        description: 'Kernel Sub Level (e.g. 180 or X for LTS auto)'
+        required: true
+        default: 'X'
+      revision:
+        description: 'Optional revision string used for some GKI URLs'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      matrix:
+        build_type: [normal, make]   # keep both to satisfy matrix checks in the workflow
+
+    env:
+      REPO_URL: "https://github.com/mizdrake7/WILDFlower-android13-5.15-common-GKI.git"
+      REPO_BRANCH: "android13-5.15"
+      ANYKERNEL_BRANCH: "gki-2.0"
+      KERNEL_GIT_NAME: "WILDFlower-android13-5.15-common-GKI"
+      # default cross compile - override if required via secrets or job env
+      CROSS_COMPILE: "aarch64-linux-android-"
+
+    steps:
+      - name: Checkout repo (build scripts / patches)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set CONFIG Environment Variable
+        id: set_config
+        run: |
+          CONFIG="${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}"
+          echo "CONFIG=$CONFIG" >> $GITHUB_ENV
+          echo "CONFIG" && echo "$CONFIG"
+
+      - name: Install base packages (setup build environment)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            libelf-dev libssl-dev build-essential bc bison flex unzip ccache curl lz4 \
+            python3 python3-pip git pkg-config zlib1g-dev llvm clang protobuf-compiler \
+            openjdk-11-jdk ninja-build
+
+      - name: Prepare repo tool and build tools
+        run: |
+          mkdir -p ./git-repo
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o ./git-repo/repo
+          chmod +x ./git-repo/repo
+          echo "REPO=$GITHUB_WORKSPACE/git-repo/repo" >> $GITHUB_ENV
+
+          # Clone aosp helper tools used later (mkbootimg/unpack/avbtool) - shallow clones
+          AOSP_MIRROR=https://android.googlesource.com
+          BRANCH=main-kernel-2025 || true
+          git clone --depth 1 "$AOSP_MIRROR/kernel/prebuilts/build-tools" -b "$BRANCH" kernel-build-tools || true
+          git clone --depth 1 "$AOSP_MIRROR/platform/system/tools/mkbootimg" -b "$BRANCH" mkbootimg || true
+
+          # Export tool paths if present
+          if [ -d "$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/bin" ]; then
+            echo "AVBTOOL=$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/bin/avbtool" >> $GITHUB_ENV
+            echo "PATH=$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/bin:$PATH" >> $GITHUB_ENV
+          fi
+          if [ -f "$GITHUB_WORKSPACE/mkbootimg/mkbootimg.py" ]; then
+            echo "MKBOOTIMG=$GITHUB_WORKSPACE/mkbootimg/mkbootimg.py" >> $GITHUB_ENV
+            echo "UNPACK_BOOTIMG=$GITHUB_WORKSPACE/mkbootimg/unpack_bootimg.py" >> $GITHUB_ENV
+          fi
+          # set boot sign key path default if toolset exists
+          if [ -d "$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/share/avb" ]; then
+            echo "BOOT_SIGN_KEY_PATH=$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/share/avb/testkey_rsa2048.pem" >> $GITHUB_ENV
+          fi
+
+      - name: Set boot sign key (from secret if provided)
+        env:
+          BOOT_SIGN_KEY: ${{ secrets.BOOT_SIGN_KEY }}
+        run: |
+          # Write provided key to expected path
+          if [ -n "$BOOT_SIGN_KEY" ]; then
+            mkdir -p "$(dirname "$BOOT_SIGN_KEY_PATH")" || true
+            echo "$BOOT_SIGN_KEY" > "${BOOT_SIGN_KEY_PATH:-./testkey_rsa2048.pem}"
+            chmod 600 "${BOOT_SIGN_KEY_PATH:-./testkey_rsa2048.pem}"
+          fi
+
+      - name: Clone AnyKernel3 and other deps used by patches
+        run: |
+          git clone https://github.com/WildKernels/AnyKernel3.git -b ${ANYKERNEL_BRANCH} --depth 1 || true
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git --depth 1 || true
+          git clone https://github.com/WildKernels/kernel_patches.git --depth 1 || true
+
+      - name: Initialize and Sync Kernel Source (repo)
+        run: |
+          set -e
+          CONFIG_DIR="$CONFIG"
+          mkdir -p "$CONFIG_DIR"
+          cd "$CONFIG_DIR"
+
+          FORMATTED_BRANCH="${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.os_patch_level }}"
+          # Repo binary path from earlier step
+          REPO_BIN="${REPO:-$GITHUB_WORKSPACE/git-repo/repo}"
+          if [ ! -x "$REPO_BIN" ]; then
+            chmod +x "$REPO_BIN" || true
+          fi
+
+          # default to kernel common manifest if available; if repo tool missing, fallback to git clone
+          if [ -x "$REPO_BIN" ]; then
+            "$REPO_BIN" init --depth=1 --u https://android.googlesource.com/kernel/manifest -b common-"$FORMATTED_BRANCH" --repo-rev=v2.16 || true
+            "$REPO_BIN" --trace sync -c -j$(nproc) --no-tags --fail-fast || true
+          else
+            # fallback: clone your specified kernel tree shallow if repo unavailable
+            cd ..
+            git clone --depth 1 -b ${REPO_BRANCH} ${REPO_URL} kernel || true
+            cd "$CONFIG_DIR"
+          fi
+
+      - name: Extract Actual Sublevel for LTS Builds (when sub_level == X)
+        if: ${{ inputs.sub_level == 'X' }}
+        run: |
+          set -e || true
+          cd "$CONFIG"
+          if [ -f "common/Makefile" ]; then
+            ACTUAL_SUBLEVEL=$(grep '^SUBLEVEL\s*[:=]\s*' common/Makefile | head -n1 | awk -F'[:=]' '{print $2}' | xargs || true)
+            if [ -n "$ACTUAL_SUBLEVEL" ]; then
+              echo "ACTUAL_SUBLEVEL=$ACTUAL_SUBLEVEL" >> $GITHUB_ENV
+              NEW_CONFIG="${{ inputs.android_version }}-${{ inputs.kernel_version }}-$ACTUAL_SUBLEVEL"
+              echo "CONFIG=$NEW_CONFIG" >> $GITHUB_ENV
+              # rename directory for downstream compatibility
+              cd ..
+              if [ -d "$CONFIG" ] && [ ! -d "$NEW_CONFIG" ]; then
+                mv "$CONFIG" "$NEW_CONFIG" || true
+              fi
+            fi
+          fi
+
+      - name: Apply ptrace patch for older kernels (if needed)
+        if: ${{ format('0x{0}', inputs.kernel_version) && fromJSON('\"' + inputs.kernel_version + '\"') < 5.16 }}
+        run: |
+          # safe attempt (the if condition above sometimes fails for strings), so do guard in-script
+          cd "$CONFIG" || true
+          KVER="${{ inputs.kernel_version }}"
+          # crude numeric check
+          MAJOR=$(echo "$KVER" | cut -d. -f1)
+          MINOR=$(echo "$KVER" | cut -d. -f2 || echo 0)
+          if [ "$MAJOR" -lt 5 ] || { [ "$MAJOR" -eq 5 ] && [ "$MINOR" -lt 16 ]; }; then
+            if [ -f "../kernel_patches/gki_ptrace.patch" ]; then
+              patch -p1 -F 3 < "../kernel_patches/gki_ptrace.patch" || true
+            fi
+          fi
+
+      - name: Add KernelSU
+        run: |
+          cd "$CONFIG" || true
+          curl -LSs "https://raw.githubusercontent.com/WildKernels/Wild_KSU/wild/kernel/setup.sh" | bash -s wild || true
+
+      - name: Apply SUSFS patches + copy kernel hooks
+        run: |
+          set -e || true
+          cd "$CONFIG" || true
+          # Attempt to copy the main patch if it exists
+          if [ -d "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches" ]; then
+            cp "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}.patch" ./common/ 2>/dev/null || true
+            cd common || true
+            patch -p1 --forward < 50_add_susfs_in_gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}.patch 2>/dev/null || true
+            cd ..
+            cp -r "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/fs/" ./common/fs/ 2>/dev/null || true
+            cp -r "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/include/linux/" ./common/include/linux/ 2>/dev/null || true
+          fi
+
+      - name: Apply Hooks and Hide Stuff patches
+        run: |
+          cd "$CONFIG/common" || true
+          if [ -f "$GITHUB_WORKSPACE/kernel_patches/wild/hooks/scope_min_manual_hooks_v1.4.patch" ]; then
+            cp "$GITHUB_WORKSPACE/kernel_patches/wild/hooks/scope_min_manual_hooks_v1.4.patch" .
+            patch -p1 --forward -F 3 < scope_min_manual_hooks_v1.4.patch || true
+          fi
+          if [ -f "$GITHUB_WORKSPACE/kernel_patches/69_hide_stuff.patch" ]; then
+            cp "$GITHUB_WORKSPACE/kernel_patches/69_hide_stuff.patch" .
+            patch -p1 --forward -F 3 < 69_hide_stuff.patch || true
+          fi
+
+      - name: Apply Module Symbol Version Fix (best-effort)
+        run: |
+          cd "$CONFIG" || true
+          if [ -d "./common/kernel/module" ]; then
+            sed -i '/bad_version:/{:a;n;/return 0;/{s/return 0;/return 1;/;b};ba}' ./common/kernel/module/version.c 2>/dev/null || true
+          else
+            sed -i '/bad_version:/{:a;n;/return 0;/{s/return 0;/return 1;/;b};ba}' ./common/kernel/module.c 2>/dev/null || true
+          fi
+
+      - name: Apply Kernel Configuration (append to gki_defconfig)
+        run: |
+          set -e || true
+          defconfig="./common/arch/arm64/configs/gki_defconfig"
+          if [ -f "$defconfig" ]; then
+            # Append configuration lines if not already present
+            grep -qxF "CONFIG_KSU=y" "$defconfig" || echo "CONFIG_KSU=y" >> "$defconfig"
+            grep -qxF "CONFIG_KSU_KPROBES_HOOK=n" "$defconfig" || echo "CONFIG_KSU_KPROBES_HOOK=n" >> "$defconfig"
+
+            # Append many required flags (idempotent)
+            for line in \
+"CONFIG_TMPFS_XATTR=y" \
+"CONFIG_TMPFS_POSIX_ACL=y" \
+"CONFIG_IP_NF_TARGET_TTL=y" \
+"CONFIG_IP6_NF_TARGET_HL=y" \
+"CONFIG_IP6_NF_MATCH_HL=y" \
+"CONFIG_TCP_CONG_ADVANCED=y" \
+"CONFIG_TCP_CONG_BBR=y" \
+"CONFIG_NET_SCH_FQ=y" \
+"CONFIG_TCP_CONG_BIC=n" \
+"CONFIG_TCP_CONG_WESTWOOD=n" \
+"CONFIG_TCP_CONG_HTCP=n" \
+"CONFIG_IP_SET=y" \
+"CONFIG_IP_SET_MAX=256" \
+"CONFIG_IP_SET_BITMAP_IP=y" \
+"CONFIG_KSU_SUSFS=y" \
+"CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" \
+"CONFIG_KSU_SUSFS_SUS_PATH=y" \
+"CONFIG_KSU_SUSFS_SUS_MOUNT=y" \
+"CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" \
+"CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" \
+"CONFIG_KSU_SUSFS_TRY_UMOUNT=y" \
+"CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" \
+"CONFIG_KSU_SUSFS_SUS_KSTAT=y" \
+"CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n" \
+"CONFIG_KSU_SUSFS_SPOOF_UNAME=y" \
+"CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" \
+"CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" \
+"CONFIG_KSU_SUSFS_ENABLE_LOG=y" \
+"CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" \
+"CONFIG_KSU_SUSFS_SUS_SU=n" \
+"CONFIG_LTO_CLANG_THIN=y" \
+"CONFIG_LTO_CLANG=y" \
+"CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" \
+"CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3=n" ; do
+              grep -qxF "$line" "$defconfig" || echo "$line" >> "$defconfig"
+            done
+            # remove check_defconfig token safely
+            sed -i 's/check_defconfig//' ./common/build.config.gki 2>/dev/null || true
+          fi
+
+      - name: Build kernel (make flow)
+        if: ${{ matrix.build_type == 'make' }}
+        run: |
+          set -e
+          KERNEL_PATH="$GITHUB_WORKSPACE/$CONFIG"
+          cd "$KERNEL_PATH/common" || exit 1
+
+          # detect clang dir if any and set PATH
+          if [ -d "$KERNEL_PATH/prebuilts/clang/host/linux-x86" ]; then
+            CLANG_BIN=$(ls -d "$KERNEL_PATH"/prebuilts/clang/host/linux-x86/clang-r* 2>/dev/null | tail -n1)
+            if [ -n "$CLANG_BIN" ]; then
+              export PATH="$CLANG_BIN/bin:$PATH"
+            fi
+          fi
+
+          MAKE_ARGS="LLVM=1 ARCH=arm64 CROSS_COMPILE=${CROSS_COMPILE} \
+            RUSTC=$KERNEL_PATH/prebuilts/rust/linux-x86/1.73.0b/bin/rustc \
+            PAHOLE=$KERNEL_PATH/prebuilts/kernel-build-tools/linux-x86/bin/pahole \
+            LD=ld.lld HOSTLD=ld.lld"
+          make -j$(nproc --all) O=out $MAKE_ARGS KCFLAGS+="-Wno-error -O2 -flto=thin -fno-stack-protector" gki_defconfig || exit 1
+          make -j$(nproc --all) O=out $MAKE_ARGS KCFLAGS+="-Wno-error -O2 -flto=thin -fno-stack-protector" || exit 1
+
+      - name: Build kernel (legacy make for gki_defconfig)
+        if: ${{ matrix.build_type == 'normal' }}
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE/$CONFIG" || true
+          # try to use local kernel folder if it exists
+          if [ -d "kernel" ]; then
+            cd kernel
+            export ARCH=arm64
+            export SUBARCH=arm64
+            export CROSS_COMPILE=${CROSS_COMPILE}
+            export CC=clang
+            export LLVM=1
+            # Use prebuilts clang if available
+            if [ -d "$PWD/prebuilts/clang/host/linux-x86/bin" ]; then
+              export PATH="$PWD/prebuilts/clang/host/linux-x86/bin:$PATH"
+            fi
+            make -j$(nproc) gki_defconfig || true
+            make -j$(nproc) || true
+          else
+            # fallback: try common build scripts (bazel or build/build.sh)
+            if [ -f "build/build.sh" ]; then
+              LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 bash build/build.sh || true
+            else
+              tools/bazel build --config=fast --lto=thin //common:kernel_aarch64_dist || true
+            fi
+          fi
+
+      - name: Create Kernel ZIP (AnyKernel)
+        run: |
+          set -e
+          # pick Image from several possible locations
+          IMAGE_SRC=""
+          if [ -f "$CONFIG/common/out/arch/arm64/boot/Image" ]; then
+            IMAGE_SRC="$CONFIG/common/out/arch/arm64/boot/Image"
+          elif [ -f "./$CONFIG/out/${{ inputs.android_version }}-${{ inputs.kernel_version }}/dist/Image" ]; then
+            IMAGE_SRC="./$CONFIG/out/${{ inputs.android_version }}-${{ inputs.kernel_version }}/dist/Image"
+          elif [ -f "./$CONFIG/bazel-bin/common/kernel_aarch64/Image" ]; then
+            IMAGE_SRC="./$CONFIG/bazel-bin/common/kernel_aarch64/Image"
+          elif [ -f "./kernel/arch/arm64/boot/Image" ]; then
+            IMAGE_SRC="./kernel/arch/arm64/boot/Image"
+          fi
+
+          if [ -z "$IMAGE_SRC" ]; then
+            echo "Error: Image file not found in any expected location"
+            exit 1
+          fi
+
+          cp "$IMAGE_SRC" AnyKernel3/Image || true
+
+          # choose sublevel for naming - prefer ACTUAL_SUBLEVEL if set
+          SUBLEVEL_FOR_NAME="${ACTUAL_SUBLEVEL:-${{ inputs.sub_level }}}"
+          # KSUVER computed previously if available
+          KSUVER="${KSUVER:-unknown}"
+          ZIP_NAME="WFKSU-${KSUVER}-${{ inputs.android_version }}-${{ inputs.kernel_version }}.${SUBLEVEL_FOR_NAME}-${{ inputs.os_patch_level }}-AnyKernel3.zip"
+          cd AnyKernel3 || true
+          zip -r "../$ZIP_NAME" ./*
+
+      - name: Prepare bootimgs (Android 13)
+        run: |
+          set -e || true
+          mkdir -p bootimgs || true
+          # Try to copy any created Image files into bootimgs
+          if [ -f "./Image" ]; then cp -f ./Image ./bootimgs/Image || true; fi
+          if [ -f "./Image.lz4" ]; then cp -f ./Image.lz4 ./bootimgs/Image.lz4 || true; fi
+          if [ -f "./Image.gz" ]; then cp -f ./Image.gz ./bootimgs/Image.gz || true; fi
+
+          # gzip Images if present
+          if [ -f "./Image" ]; then
+            gzip -n -k -f -9 ./Image || true
+            gzip -n -k -f -9 ./Image > ./bootimgs/Image.gz || true
+          fi
+
+      - name: Build boot images (GKI-style) for Android13/14/15 (best-effort)
+        if: ${{ (inputs.android_version == 'android13' || inputs.android_version == 'android14' || inputs.android_version == 'android15') && matrix.build_type == 'normal' }}
+        run: |
+          set -e || true
+          cd bootimgs || true
+          SUBLEVEL_FOR_NAME="${ACTUAL_SUBLEVEL:-${{ inputs.sub_level }}}"
+          MKBOOTIMG="${MKBOOTIMG:-$GITHUB_WORKSPACE/mkbootimg/mkbootimg.py}"
+          AVBTOOL="${AVBTOOL:-$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/bin/avbtool}"
+          BOOT_SIGN_KEY_PATH="${BOOT_SIGN_KEY_PATH:-./testkey_rsa2048.pem}"
+
+          if [ -x "$MKBOOTIMG" ]; then
+            $MKBOOTIMG --header_version 4 --kernel Image --output boot.img || true
+            if [ -x "$AVBTOOL" ]; then
+              $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot.img --algorithm SHA256_RSA2048 --key "$BOOT_SIGN_KEY_PATH" || true
+            fi
+            cp ./boot.img ../WKSU-${KSUVER:-unknown}-${{ inputs.android_version }}-${{ inputs.kernel_version }}.${SUBLEVEL_FOR_NAME}-${{ inputs.os_patch_level }}-boot.img || true
+
+            # gz and lz4 variants if available
+            if [ -f "./Image.gz" ]; then
+              $MKBOOTIMG --header_version 4 --kernel Image.gz --output boot-gz.img || true
+              cp ./boot-gz.img ../WKSU-${KSUVER:-unknown}-${{ inputs.android_version }}-${{ inputs.kernel_version }}.${SUBLEVEL_FOR_NAME}-${{ inputs.os_patch_level }}-boot-gz.img || true
+            fi
+            if [ -f "./Image.lz4" ]; then
+              $MKBOOTIMG --header_version 4 --kernel Image.lz4 --output boot-lz4.img || true
+              cp ./boot-lz4.img ../WKSU-${KSUVER:-unknown}-${{ inputs.android_version }}-${{ inputs.kernel_version }}.${SUBLEVEL_FOR_NAME}-${{ inputs.os_patch_level }}-boot-lz4.img || true
+            fi
+          else
+            echo "mkbootimg missing; skipped bootimg build" || true
+          fi
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: WKSU-${{ env.KSUVER || 'unknown' }}-${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ env.ACTUAL_SUBLEVEL || inputs.sub_level }}-${{ inputs.os_patch_level }}-${{ matrix.build_type }}
+          path: |
+            *.zip
+            *.img
+            bootimgs/**
